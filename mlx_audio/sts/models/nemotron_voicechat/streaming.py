@@ -114,7 +114,11 @@ class VoiceChatStreamingSession:
         max_streaming_seconds: float | None = None,
         use_language_cache: bool = True,
         use_perception_cache: bool = True,
+        tts_guidance: bool = True,
     ):
+        """``tts_guidance`` runs the TTS with classifier-free guidance (the
+        model's inference_guidance_scale; a batch of two per frame). Off, the
+        TTS backbone runs once per frame."""
         if max_streaming_seconds is not None and max_streaming_seconds <= 0:
             raise ValueError("max_streaming_seconds must be positive")
         self.parent = parent
@@ -133,6 +137,14 @@ class VoiceChatStreamingSession:
         self._audio_window = mx.zeros((0,), dtype=mx.float32)
         left, right = self.config.encoder.att_context_size[0]
         self._perception_window_frames = max(2, left + right + 1)
+        # The LLM's compute dtype: its embedding weights' (bf16 when quantized).
+        head = self.model.stt_model.lm_head
+        weight = head.weight
+        # Quantized: the scales carry the float type the layer computes in.
+        self._compute_dtype = (
+            weight.dtype if mx.issubdtype(weight.dtype, mx.floating)
+            else getattr(head, "scales", weight).dtype if hasattr(head, "scales") else mx.bfloat16
+        )
         self._language_cache = (
             self.model.stt_model.make_cache() if use_language_cache else None
         )
@@ -164,11 +176,12 @@ class VoiceChatStreamingSession:
         self._function = _TokenAccumulator(self.tokenizer, special_ids)
         self._rnnt = _RNNTState(self)
         self._codec_cache = CausalConv1dCache()
+        self._tts_guidance = tts_guidance
         mx.random.seed(seed)
         prompt = self.parent._tts_prompt()
         self._previous_code, self._tts_cache = self.model.tts_model.tts_model.warmup(
             *prompt,
-            guidance_enabled=True,
+            guidance_enabled=self._tts_guidance,
         )
         self._prefill_prompt(system_prompt)
 
@@ -181,6 +194,9 @@ class VoiceChatStreamingSession:
         return self._frame_index
 
     def _language_step(self, inputs: mx.array):
+        # The fused frame arrives float32; against bf16/quantized weights that
+        # would promote the whole LLM step (and its caches) to float32.
+        inputs = inputs.astype(self._compute_dtype)
         if self._language_cache is not None:
             return self.model.stt_model(inputs, cache=self._language_cache)
         self._input_history.append(inputs)
@@ -283,7 +299,7 @@ class VoiceChatStreamingSession:
                     self._tts_cache,
                     text_eos_id=self.config.eos_token_id,
                     silence_codes=self.model.tts_model.codec_silence_tokens[None, None],
-                    guidance_enabled=True,
+                    guidance_enabled=self._tts_guidance,
                 )
             )
             code = self._previous_code

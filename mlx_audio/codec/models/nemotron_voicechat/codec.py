@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -430,7 +431,28 @@ class NemotronVoiceChatCodec(nn.Module):
 
         if cache is None:
             raise ValueError("decode_step requires a per-stream cache")
-        return self.decode(codes, cache=cache, flush=flush)
+        # After the first step every cache entry exists with a fixed shape:
+        # one compiled graph per (entries, input shape) instead of the many
+        # small conv kernels per frame. The first step and a flush run eager.
+        if flush or not cache.cache:
+            return self.decode(codes, cache=cache, flush=flush)
+        keys = tuple(sorted(cache.cache, key=str))
+        key = (keys, codes.shape, codes.dtype, tuple((cache.cache[k].shape, cache.cache[k].dtype) for k in keys))
+        compiled = self.__dict__.setdefault("_compiled_decode", SimpleNamespace(fns={}))
+        fn = compiled.fns.get(key)
+        if fn is None:
+
+            def step(c, *states):
+                tmp = CausalConv1dCache()
+                tmp.cache = dict(zip(keys, states))
+                out = self.decode(c, cache=tmp)
+                return (out, *[tmp.cache[k] for k in keys])
+
+            fn = mx.compile(step)
+            compiled.fns[key] = fn
+        out, *states = fn(codes, *[cache.cache[k] for k in keys])
+        cache.cache = dict(zip(keys, states))
+        return out
 
     def sanitize(
         self, weights: Mapping[str, mx.array], prefix: str = ""

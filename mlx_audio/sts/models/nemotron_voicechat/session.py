@@ -128,6 +128,7 @@ class VoiceChatSession:
         max_streaming_seconds: float | None = None,
         use_language_cache: bool = True,
         use_perception_cache: bool = True,
+        tts_guidance: bool = True,
     ):
         from .streaming import VoiceChatStreamingSession
 
@@ -138,6 +139,7 @@ class VoiceChatSession:
             max_streaming_seconds=max_streaming_seconds,
             use_language_cache=use_language_cache,
             use_perception_cache=use_perception_cache,
+            tts_guidance=tts_guidance,
         )
 
     def generate(

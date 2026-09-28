@@ -77,13 +77,24 @@ class RelPositionMultiHeadAttention(nn.Module):
         o = o.transpose(0, 2, 1, 3).reshape(batch, seq, self.n_feat)
         return self.linear_out(o)
 
-    def stream(self, q_in: mx.array, kv_in: mx.array, pos_emb: mx.array) -> mx.array:
+    def stream(
+        self,
+        q_in: mx.array,
+        kv_in: mx.array,
+        pos_emb: mx.array,
+        pos_proj: mx.array | None = None,
+    ) -> mx.array:
         """Cache-aware step: q_in (B,c,d) attends to kv_in (B,L,d), no mask (the
-        L-window IS the allowed context). pos_emb is for length L (2L-1)."""
+        L-window IS the allowed context). pos_emb is for length L (2L-1).
+
+        ``pos_proj`` optionally supplies ``linear_pos(pos_emb)`` precomputed: it
+        depends only on the window length, so streaming callers cache it
+        instead of redoing a (2L-1) x d x d matmul per layer per frame.
+        """
         q = self.linear_q(q_in)
         k = self.linear_k(kv_in)
         v = self.linear_v(kv_in)
-        p = self.linear_pos(pos_emb)
+        p = self.linear_pos(pos_emb) if pos_proj is None else pos_proj
         batch, c, _ = q.shape
         ksz = kv_in.shape[1]
         pos_len = p.shape[1]

@@ -486,3 +486,109 @@ def test_post_load_hook_loads_tokenizer_from_model_folder(tmp_path, monkeypatch)
 
     assert calls == [str(tmp_path)]
     assert isinstance(model.tokenizer, FakeTokenizer)
+
+
+def _full_selected_means(proj, inputs, idx, num_predictions, low_rank):
+    b, l, _ = inputs.shape
+    full = proj(inputs).reshape(b, l, num_predictions, low_rank)
+    return mx.take_along_axis(full, idx[..., None, None], axis=2).squeeze(2)
+
+
+def test_selected_mog_means_match_the_full_projection():
+    from types import SimpleNamespace
+
+    import mlx.nn as nn
+
+    from mlx_audio.sts.models.nemotron_voicechat.tts import MoGHead
+
+    # CPU: exact fp32 GEMM (Metal's fp32 matmul rounds like tf32), so any
+    # indexing/layout mistake shows up instead of hiding in the tolerance.
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        _check_selected_means(MoGHead, SimpleNamespace, nn)
+    finally:
+        mx.set_default_device(previous)
+
+
+def _check_selected_means(MoGHead, SimpleNamespace, nn):
+    mx.random.seed(3)
+    hidden, predictions, rank = 64, 16, 8
+    for bias in (False, True):
+        dense = nn.Linear(hidden, predictions * rank, bias=bias)
+        quantized = nn.QuantizedLinear.from_linear(dense, group_size=32, bits=4)
+        for proj in (dense, quantized):
+            for dtype in (mx.float32, mx.bfloat16):
+                inputs = mx.random.normal((2, 3, hidden)).astype(dtype)
+                idx = mx.random.randint(0, predictions, (2, 3))
+                head = SimpleNamespace(proj_mus=proj, num_predictions=predictions, low_rank=rank)
+                got = MoGHead._selected_means(head, inputs, idx)
+                want = _full_selected_means(proj, inputs, idx, predictions, rank)
+                assert got.dtype == want.dtype, (bias, type(proj).__name__, dtype)
+                tol = 1e-5 if want.dtype == mx.float32 else 5e-2
+                assert mx.allclose(got, want, atol=tol, rtol=tol).item(), (bias, type(proj).__name__, dtype)
+
+
+def test_compiled_conformer_steady_state_matches_eager():
+    from mlx_audio.stt.models.nemotron_asr.streaming import ConformerStreamingState
+
+    model = Model(ModelConfig.from_dict(mini_config()))
+    encoder = model.stt_model.perception.encoder
+    mx.random.seed(5)
+    features = model.config.preprocessor.features if hasattr(model.config, "preprocessor") else 8
+    mels = [mx.random.normal((1, 8, features)) for _ in range(40)]  # far past the 4-frame context
+
+    def run(compiled):
+        state = ConformerStreamingState(encoder, chunk_frames=1, att_context_size=[4, 0], compile_steady=compiled)
+        out = []
+        for m in mels:
+            out += state.push(m, emit_partial=True)
+        return mx.concatenate(out, axis=1)
+
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)  # exact fp32; Metal's fp32 matmul rounds like tf32
+    try:
+        eager, compiled = run(False), run(True)
+    finally:
+        mx.set_default_device(previous)
+    assert eager.shape == compiled.shape
+    assert mx.abs(eager - compiled).max().item() < 1e-5
+
+
+def test_compiled_codes_live_on_the_model():
+    import gc
+    import weakref
+
+    model = Model(ModelConfig.from_dict(mini_config()))
+    model.tokenizer = MiniTokenizer()
+    stream = model.create_duplex_session(system_prompt="")
+    stream._rnnt.step = lambda _encoded: ("", "")
+    mx.eval([e.samples for e in stream.push_audio(mx.zeros((stream.frame_samples,)), sample_rate=16_000) if e.kind == "audio"])
+    tts = model.tts_model.tts_model
+    assert "_compiled_codes" not in tts  # not in the parameter tree
+    ref = weakref.ref(model)
+    del stream, model, tts
+    gc.collect()
+    assert ref() is None
+
+
+def test_compiled_codec_decode_step_matches_eager_decode():
+    from mlx_audio.codec.models.nemotron_voicechat import CausalConv1dCache
+
+    model = Model(ModelConfig.from_dict(mini_config()))
+    codec = model.tts_model.audio_codec
+    cfg = codec.config
+    mx.random.seed(7)
+    steps = [mx.random.randint(0, cfg.codebook_size, (1, cfg.num_quantizers, 1)) for _ in range(12)]
+
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)  # exact fp32; Metal's fp32 matmul rounds like tf32
+    try:
+        eager_cache, step_cache = CausalConv1dCache(), CausalConv1dCache()
+        eager = mx.concatenate([codec.decode(c, cache=eager_cache) for c in steps], axis=-1)
+        stepped = mx.concatenate([codec.decode_step(c, step_cache) for c in steps], axis=-1)
+    finally:
+        mx.set_default_device(previous)
+    assert "_compiled_decode" in codec.__dict__ and codec.__dict__["_compiled_decode"].fns
+    assert eager.shape == stepped.shape
+    assert mx.abs(eager - stepped).max().item() < 1e-5
