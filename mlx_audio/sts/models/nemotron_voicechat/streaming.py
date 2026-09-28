@@ -114,7 +114,11 @@ class VoiceChatStreamingSession:
         max_streaming_seconds: float | None = None,
         use_language_cache: bool = True,
         use_perception_cache: bool = True,
+        tts_guidance: bool = True,
     ):
+        """``tts_guidance`` runs the TTS with classifier-free guidance (the
+        model's inference_guidance_scale; a batch of two per frame). Off, the
+        TTS backbone runs once per frame."""
         if max_streaming_seconds is not None and max_streaming_seconds <= 0:
             raise ValueError("max_streaming_seconds must be positive")
         self.parent = parent
@@ -167,11 +171,12 @@ class VoiceChatStreamingSession:
         self._function = _TokenAccumulator(self.tokenizer, special_ids)
         self._rnnt = _RNNTState(self)
         self._codec_cache = CausalConv1dCache()
+        self._tts_guidance = tts_guidance
         mx.random.seed(seed)
         prompt = self.parent._tts_prompt()
         self._previous_code, self._tts_cache = self.model.tts_model.tts_model.warmup(
             *prompt,
-            guidance_enabled=True,
+            guidance_enabled=self._tts_guidance,
         )
         self._prefill_prompt(system_prompt)
 
@@ -289,7 +294,7 @@ class VoiceChatStreamingSession:
                     self._tts_cache,
                     text_eos_id=self.config.eos_token_id,
                     silence_codes=self.model.tts_model.codec_silence_tokens[None, None],
-                    guidance_enabled=True,
+                    guidance_enabled=self._tts_guidance,
                 )
             )
             code = self._previous_code
