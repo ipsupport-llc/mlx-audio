@@ -100,8 +100,9 @@ class MoGHead(nn.Module):
         else:
             w = proj.weight.reshape(self.num_predictions, self.low_rank, hidden)[flat]
         # The dtype the full projection would compute in: the inputs' and the
-        # (dequantized) weights' promoted type, not the weights' alone.
-        dtype = mx.result_type(inputs.dtype, w.dtype)
+        # (dequantized) weights' promoted type, not the weights' alone
+        # (a zero-size sum: mx.result_type needs MLX >= 0.32).
+        dtype = (mx.zeros((0,), inputs.dtype) + mx.zeros((0,), w.dtype)).dtype
         x = inputs.reshape(batch * length, hidden, 1).astype(dtype)
         out = (w.astype(dtype) @ x).reshape(batch, length, self.low_rank)
         if "bias" in proj:
