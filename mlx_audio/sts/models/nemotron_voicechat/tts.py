@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,10 +14,6 @@ from . import t5gemma
 from .config import VoiceChatTTSConfig
 
 
-
-# EARTTSModel._generate_codes compiled per (model, guidance mode); outside the
-# module so it stays out of its parameter tree.
-_COMPILED_CODES: dict = {}
 
 class RMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1.0e-6):
@@ -102,13 +99,16 @@ class MoGHead(nn.Module):
             ).reshape(batch * length, self.low_rank, hidden)
         else:
             w = proj.weight.reshape(self.num_predictions, self.low_rank, hidden)[flat]
-        x = inputs.reshape(batch * length, hidden, 1).astype(w.dtype)
-        out = (w @ x).reshape(batch, length, self.low_rank)
+        # The dtype the full projection would compute in: the inputs' and the
+        # (dequantized) weights' promoted type, not the weights' alone.
+        dtype = mx.result_type(inputs.dtype, w.dtype)
+        x = inputs.reshape(batch * length, hidden, 1).astype(dtype)
+        out = (w.astype(dtype) @ x).reshape(batch, length, self.low_rank)
         if "bias" in proj:
             out = out + proj["bias"].reshape(self.num_predictions, self.low_rank)[flat].reshape(
                 batch, length, self.low_rank
-            )
-        return out.astype(inputs.dtype)
+            ).astype(dtype)
+        return out
 
     def infer(
         self,
@@ -426,15 +426,17 @@ class EARTTSModel(nn.Module):
         """One frame's codes (num_iterations MoG steps over the RVQ levels:
         hundreds of small kernels) as one compiled graph per guidance mode,
         the random state threaded through so the sampled codes are the same."""
-        key = (id(self), guidance_enabled)
-        fn = _COMPILED_CODES.get(key)
+        # Held by the model itself (a plain attribute, outside the parameter
+        # tree), so the graphs go when the model does.
+        compiled = self.__dict__.setdefault("_compiled_codes", SimpleNamespace(fns={}))
+        fn = compiled.fns.get(guidance_enabled)
         if fn is None:
             fn = mx.compile(
                 lambda h: self._generate_codes_eager(h, guidance_enabled=guidance_enabled),
                 inputs=[mx.random.state],
                 outputs=[mx.random.state],
             )
-            _COMPILED_CODES[key] = fn
+            compiled.fns[guidance_enabled] = fn
         return fn(hidden)
 
     def _generate_codes_eager(self, hidden: mx.array, *, guidance_enabled: bool) -> mx.array:

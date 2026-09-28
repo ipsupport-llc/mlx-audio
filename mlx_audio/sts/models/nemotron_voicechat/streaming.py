@@ -138,8 +138,13 @@ class VoiceChatStreamingSession:
         left, right = self.config.encoder.att_context_size[0]
         self._perception_window_frames = max(2, left + right + 1)
         # The LLM's compute dtype: its embedding weights' (bf16 when quantized).
-        weight = self.model.stt_model.lm_head.weight
-        self._compute_dtype = weight.dtype if mx.issubdtype(weight.dtype, mx.floating) else mx.bfloat16
+        head = self.model.stt_model.lm_head
+        weight = head.weight
+        # Quantized: the scales carry the float type the layer computes in.
+        self._compute_dtype = (
+            weight.dtype if mx.issubdtype(weight.dtype, mx.floating)
+            else getattr(head, "scales", weight).dtype if hasattr(head, "scales") else mx.bfloat16
+        )
         self._language_cache = (
             self.model.stt_model.make_cache() if use_language_cache else None
         )

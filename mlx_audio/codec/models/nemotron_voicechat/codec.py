@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -9,10 +10,6 @@ import mlx.nn as nn
 from mlx_audio.dsp import ISTFTCache, hanning, stft
 
 from .config import NemotronVoiceChatCodecConfig
-
-
-# decode_step graphs, compiled per (codec, cache entries, input shape).
-_COMPILED_DECODE: dict = {}
 
 
 class CausalConv1dCache:
@@ -440,8 +437,9 @@ class NemotronVoiceChatCodec(nn.Module):
         if flush or not cache.cache:
             return self.decode(codes, cache=cache, flush=flush)
         keys = tuple(sorted(cache.cache, key=str))
-        key = (id(self), keys, codes.shape, codes.dtype)
-        fn = _COMPILED_DECODE.get(key)
+        key = (keys, codes.shape, codes.dtype, tuple((cache.cache[k].shape, cache.cache[k].dtype) for k in keys))
+        compiled = self.__dict__.setdefault("_compiled_decode", SimpleNamespace(fns={}))
+        fn = compiled.fns.get(key)
         if fn is None:
 
             def step(c, *states):
@@ -451,7 +449,7 @@ class NemotronVoiceChatCodec(nn.Module):
                 return (out, *[tmp.cache[k] for k in keys])
 
             fn = mx.compile(step)
-            _COMPILED_DECODE[key] = fn
+            compiled.fns[key] = fn
         out, *states = fn(codes, *[cache.cache[k] for k in keys])
         cache.cache = dict(zip(keys, states))
         return out

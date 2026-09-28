@@ -72,9 +72,11 @@ class ConformerStreamingState:
         # Run the encoder in its weight dtype: the mel frontend yields float32, and
         # float32 activations against bf16 weights promote every matmul to float32
         # (3.4x slower per frame on an M5, same tokens).
-        self.dtype = encoder.pre_encode.out.weight.dtype
+        out = encoder.pre_encode.out
+        self.dtype = out.weight.dtype
         if not mx.issubdtype(self.dtype, mx.floating):
-            self.dtype = mx.bfloat16  # quantized weights: compute in bf16
+            # quantized: the scales carry the float type the layer computes in
+            self.dtype = out.scales.dtype if hasattr(out, "scales") else mx.bfloat16
         # linear_pos(pos_emb) per layer, keyed by window length (steady state: one key)
         self._pos_proj: dict[int, list[mx.array]] = {}
         self.attn_cache = [None] * n
