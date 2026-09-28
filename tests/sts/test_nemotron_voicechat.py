@@ -321,3 +321,168 @@ def test_quantize_only_supported_linear_weights():
     assert quantized["stt_model.llm.linear.bias"].shape == (8,)
     assert quantized["stt_model.perception.linear.weight"].shape == (8, 64)
     assert quantized["stt_model.llm.conv.weight"].shape == (8, 3, 4)
+
+
+def mini_runtime_config():
+    """The mini model in the mlx-vlm (``mlx_runtime_config_version: 2``) layout
+    used by the mlx-community checkpoints."""
+    nemo = mini_config()
+    stt = nemo["model"]["stt"]["model"]["perception"]
+    speech = nemo["model"]["speech_generation"]["model"]
+    backbone = speech["tts_config"]["backbone_config"]
+    mog = speech["tts_config"]["mog_head_config"]
+    codec = speech["codec_config"]
+    rnnt = nemo["_rnnt_merge_info"]
+    return {
+        "mlx_runtime_config_version": 2,
+        "model_type": "nemotron_voicechat",
+        "architectures": ["NemotronVoiceChatForConditionalGeneration"],
+        "text_config": {
+            **nemo["mlx_audio"]["llm_config"],
+            "hybrid_override_pattern": "M*-",
+        },
+        "audio_config": {
+            "preprocessor": {"sample_rate": 16_000, **stt["preprocessor"]},
+            "encoder": {
+                **stt["encoder"],
+                "att_context_size": [stt["encoder"]["att_context_size"]],
+            },
+            "decoder": {
+                **rnnt["decoder_config"]["prednet"],
+                "vocab_size": 8,
+                "blank_as_pad": True,
+            },
+            "joint": {**rnnt["joint_config"]["jointnet"], "num_classes": 8},
+            "output_dim": 8,
+            "max_symbols": 10,
+        },
+        "tts_config": {
+            **backbone,
+            "latent_size": 4,
+            "codebook_size": 8,
+            "num_quantizers": 2,
+            "exponent": 3.0,
+            "char_vocab_size": 4,
+            "mog_head": {**mog, "min_log_std": -4.0},
+            "guidance_scale": 0.2,
+            "top_p": 0.95,
+            "noise_scale": 0.001,
+            "audio_prompt_duration": 0.002,
+        },
+        "codec_config": {
+            "sample_rate": 22_050,
+            "base_channels": codec["base_hidden_size"],
+            "channel_multipliers": codec["channel_mult"],
+            "downsample_rates": codec["rates"],
+            "blocks_per_stage": codec["num_blocks"],
+            "block_kernel_size": codec["kernel_size"],
+            "latent_dim": codec["latent_size"],
+            "n_fft": codec["n_fft"],
+            "hop_length": codec["hop_length"],
+            "num_quantizers": codec["num_quantizers"],
+            "codebook_size": codec["codebook_size"],
+        },
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "pad_token_id": 12,
+        "silence_token_id": 11,
+        "rnnt_blank_id": 8,
+        "input_sample_rate": 16_000,
+        "output_sample_rate": 22_050,
+        "frame_duration": 0.001,
+        "function_channel_weight": 2.0,
+        "speaker": "Aria",
+        "rnnt_vocabulary": rnnt["joint_config"]["vocabulary"],
+        "quantization": {"group_size": 64, "bits": 4},
+    }
+
+
+def test_runtime_config_is_detected():
+    from mlx_audio.sts.models.nemotron_voicechat.config import is_runtime_config
+
+    runtime = mini_runtime_config()
+    assert is_runtime_config(runtime)
+    assert not is_runtime_config(mini_config())
+    assert infer_model_type_from_config(runtime) == "nemotron_voicechat"
+
+
+def test_runtime_config_matches_nemo_config():
+    import dataclasses
+
+    nemo = ModelConfig.from_dict(mini_config()).config
+    runtime = ModelConfig.from_dict(mini_runtime_config()).config
+
+    for field in dataclasses.fields(runtime):
+        if field.name in {"pretrained_llm", "llm"}:
+            continue
+        assert getattr(runtime, field.name) == getattr(nemo, field.name), field.name
+    assert list(runtime.llm.hybrid_override_pattern) == nemo.llm.hybrid_override_pattern
+    assert runtime.llm.num_hidden_layers == nemo.llm.num_hidden_layers
+    assert runtime.llm.hidden_size == nemo.llm.hidden_size
+    assert runtime.encoder.att_context_size == [[4, 0]]
+    assert runtime.audio_prompt_frames == 2
+    assert runtime.rnnt_blank_id == 8
+    assert runtime.prepared_weights is False
+
+
+def test_runtime_config_never_fetches_remote_llm_config(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("runtime configs must not fetch the base LLM config")
+
+    monkeypatch.setattr("transformers.PretrainedConfig.get_config_dict", fail)
+    config = ModelConfig.from_dict(mini_runtime_config()).config
+    assert config.llm.vocab_size == 64
+
+
+def test_runtime_config_real_layout_values():
+    # Values as published in mlx-community/NemotronLabs-VoiceChat-11B-4bit.
+    runtime = mini_runtime_config()
+    runtime["audio_config"]["encoder"]["att_context_size"] = [[70, 0]]
+    runtime["frame_duration"] = 0.08
+    runtime["tts_config"]["audio_prompt_duration"] = 3.0
+    runtime["tts_config"].pop("char_vocab_size")
+    config = ModelConfig.from_dict(runtime).config
+
+    assert config.encoder.att_context_size == [[70, 0]]
+    assert config.audio_prompt_frames == 37
+    assert config.tts.char_vocab_size == 256
+    assert config.tts.num_iterations == 8
+    assert config.codec.sample_rate == 22_050
+
+
+def test_runtime_config_model_builds_and_streams():
+    model = Model(ModelConfig.from_dict(mini_runtime_config()))
+    model.tokenizer = MiniTokenizer()
+    stream = model.create_duplex_session(system_prompt="")
+    events = stream.push_audio(
+        mx.zeros((stream.frame_samples,), dtype=mx.float32), sample_rate=16_000
+    )
+    assert any(event.kind == "audio" for event in events)
+
+
+def test_tokenizer_source_prefers_local_files(tmp_path):
+    from mlx_audio.sts.models.nemotron_voicechat.model import _tokenizer_source
+
+    assert _tokenizer_source(tmp_path, "nvidia/base") == "nvidia/base"
+    assert _tokenizer_source(None, "nvidia/base") == "nvidia/base"
+    (tmp_path / "tokenizer.json").write_text("{}")
+    assert _tokenizer_source(tmp_path, "nvidia/base") == str(tmp_path)
+
+
+def test_post_load_hook_loads_tokenizer_from_model_folder(tmp_path, monkeypatch):
+    (tmp_path / "tokenizer.json").write_text("{}")
+    calls = []
+
+    class FakeTokenizer(MiniTokenizer):
+        pass
+
+    def from_pretrained(source, *args, **kwargs):
+        calls.append(source)
+        return FakeTokenizer()
+
+    monkeypatch.setattr("transformers.AutoTokenizer.from_pretrained", from_pretrained)
+    model = Model(ModelConfig.from_dict(mini_runtime_config()))
+    Model.post_load_hook(model, tmp_path)
+
+    assert calls == [str(tmp_path)]
+    assert isinstance(model.tokenizer, FakeTokenizer)
