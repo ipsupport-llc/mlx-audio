@@ -133,6 +133,9 @@ class VoiceChatStreamingSession:
         self._audio_window = mx.zeros((0,), dtype=mx.float32)
         left, right = self.config.encoder.att_context_size[0]
         self._perception_window_frames = max(2, left + right + 1)
+        # The LLM's compute dtype: its embedding weights' (bf16 when quantized).
+        weight = self.model.stt_model.lm_head.weight
+        self._compute_dtype = weight.dtype if mx.issubdtype(weight.dtype, mx.floating) else mx.bfloat16
         self._language_cache = (
             self.model.stt_model.make_cache() if use_language_cache else None
         )
@@ -181,6 +184,9 @@ class VoiceChatStreamingSession:
         return self._frame_index
 
     def _language_step(self, inputs: mx.array):
+        # The fused frame arrives float32; against bf16/quantized weights that
+        # would promote the whole LLM step (and its caches) to float32.
+        inputs = inputs.astype(self._compute_dtype)
         if self._language_cache is not None:
             return self.model.stt_model(inputs, cache=self._language_cache)
         self._input_history.append(inputs)

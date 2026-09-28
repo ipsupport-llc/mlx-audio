@@ -13,6 +13,11 @@ from . import t5gemma
 from .config import VoiceChatTTSConfig
 
 
+
+# EARTTSModel._generate_codes compiled per (model, guidance mode); outside the
+# module so it stays out of its parameter tree.
+_COMPILED_CODES: dict = {}
+
 class RMSNorm(nn.Module):
     def __init__(self, dims: int, eps: float = 1.0e-6):
         super().__init__()
@@ -75,6 +80,36 @@ class MoGHead(nn.Module):
             )
         )
 
+    def _selected_means(self, inputs: mx.array, mixture_indices: mx.array) -> mx.array:
+        """proj_mus(inputs) at the sampled mixture only: the low_rank rows of
+        that mixture instead of all num_predictions x low_rank outputs (a
+        1152 x 65536 mat-vec, 150 MB of bf16 read 8 times per frame, to keep
+        one mixture). Same values as projecting everything and gathering."""
+        batch, length, hidden = inputs.shape
+        flat = mixture_indices.reshape(-1)
+        proj = self.proj_mus
+        if isinstance(proj, nn.QuantizedLinear):
+            rows = self.num_predictions
+            w = proj.weight.reshape(rows, self.low_rank, -1)[flat]
+            s = proj.scales.reshape(rows, self.low_rank, -1)[flat]
+            b = proj.biases.reshape(rows, self.low_rank, -1)[flat]
+            w = mx.dequantize(
+                w.reshape(-1, w.shape[-1]),
+                s.reshape(-1, s.shape[-1]),
+                b.reshape(-1, b.shape[-1]),
+                group_size=proj.group_size,
+                bits=proj.bits,
+            ).reshape(batch * length, self.low_rank, hidden)
+        else:
+            w = proj.weight.reshape(self.num_predictions, self.low_rank, hidden)[flat]
+        x = inputs.reshape(batch * length, hidden, 1).astype(w.dtype)
+        out = (w @ x).reshape(batch, length, self.low_rank)
+        if "bias" in proj:
+            out = out + proj["bias"].reshape(self.num_predictions, self.low_rank)[flat].reshape(
+                batch, length, self.low_rank
+            )
+        return out.astype(inputs.dtype)
+
     def infer(
         self,
         inputs: mx.array,
@@ -95,15 +130,7 @@ class MoGHead(nn.Module):
             log_probabilities = apply_top_p(log_probabilities, top_p)
         mixture_indices = mx.random.categorical(log_probabilities)
 
-        batch, length, _ = inputs.shape
-        low_rank_means = self.proj_mus(inputs).reshape(
-            batch, length, self.num_predictions, self.low_rank
-        )
-        selected_means = mx.take_along_axis(
-            low_rank_means,
-            mixture_indices[..., None, None],
-            axis=2,
-        ).squeeze(2)
+        selected_means = self._selected_means(inputs, mixture_indices)
         selected_projection = self.low_mat[mixture_indices]
         means = mx.einsum("btol,btl->bto", selected_projection, selected_means)
         residual = self.proj_else(inputs)
@@ -396,6 +423,21 @@ class EARTTSModel(nn.Module):
         return codes, cache
 
     def _generate_codes(self, hidden: mx.array, *, guidance_enabled: bool) -> mx.array:
+        """One frame's codes (num_iterations MoG steps over the RVQ levels:
+        hundreds of small kernels) as one compiled graph per guidance mode,
+        the random state threaded through so the sampled codes are the same."""
+        key = (id(self), guidance_enabled)
+        fn = _COMPILED_CODES.get(key)
+        if fn is None:
+            fn = mx.compile(
+                lambda h: self._generate_codes_eager(h, guidance_enabled=guidance_enabled),
+                inputs=[mx.random.state],
+                outputs=[mx.random.state],
+            )
+            _COMPILED_CODES[key] = fn
+        return fn(hidden)
+
+    def _generate_codes_eager(self, hidden: mx.array, *, guidance_enabled: bool) -> mx.array:
         if guidance_enabled:
             conditional, _ = mx.split(hidden, 2, axis=0)
         else:
