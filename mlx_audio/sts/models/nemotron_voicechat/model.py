@@ -85,6 +85,23 @@ def sanitize_weights(
     return converted
 
 
+_TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "tokenizer.model")
+
+
+def _tokenizer_source(model_path: Path | str | None, pretrained_llm: str) -> str:
+    """Prefer a tokenizer shipped with the checkpoint over the remote base LLM.
+
+    mlx-community checkpoints bundle the Nemotron tokenizer next to the
+    weights; loading it from there keeps offline (``HF_HUB_OFFLINE=1``) loads
+    working. Checkpoints without one fall back to ``pretrained_llm``.
+    """
+    if model_path is not None:
+        path = Path(model_path)
+        if any((path / name).is_file() for name in _TOKENIZER_FILES):
+            return str(path)
+    return pretrained_llm
+
+
 class _FeaturizerBuffers(nn.Module):
     def __init__(self, config: NemotronVoiceChatConfig):
         super().__init__()
@@ -227,7 +244,9 @@ class Model(nn.Module):
     def post_load_hook(model: "Model", model_path: Path) -> "Model":
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(model.config.pretrained_llm)
+        tokenizer = AutoTokenizer.from_pretrained(
+            _tokenizer_source(model_path, model.config.pretrained_llm)
+        )
         tokenizer.bos_token = "<s>"
         tokenizer.eos_token = "</s>"
         tokenizer.pad_token = "<SPECIAL_12>"

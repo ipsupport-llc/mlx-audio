@@ -99,12 +99,170 @@ def _llm_config(config: dict[str, Any], model_name: str) -> dict[str, Any]:
     return PretrainedConfig.get_config_dict(model_name)[0]
 
 
+DEFAULT_PRETRAINED_LLM = "nvidia/NVIDIA-Nemotron-Nano-9B-v2"
+
+
+def is_runtime_config(config: dict[str, Any]) -> bool:
+    """True for the flat mlx-vlm style config used by mlx-community checkpoints.
+
+    Those configs carry ``mlx_runtime_config_version`` plus ``text_config`` /
+    ``audio_config`` / ``tts_config`` / ``codec_config`` sections instead of
+    the NeMo ``model`` / ``data`` tree.
+    """
+    if "mlx_runtime_config_version" in config:
+        return True
+    return {"text_config", "audio_config", "tts_config"}.issubset(config)
+
+
+def _att_context_size(value: Any) -> list[list[int]]:
+    """Normalise ``[left, right]`` or ``[[left, right], ...]`` to a list of pairs."""
+    if not value:
+        return [[70, 0]]
+    if isinstance(value[0], (list, tuple)):
+        return [list(pair) for pair in value]
+    return [list(value)]
+
+
+def _preprocess_args(pre: dict[str, Any], sample_rate: int) -> PreprocessArgs:
+    return PreprocessArgs(
+        sample_rate=pre.get("sample_rate", sample_rate),
+        features=pre.get("features", 128),
+        n_fft=pre.get("n_fft", 512),
+        window_size=pre.get("window_size", 0.025),
+        window_stride=pre.get("window_stride", 0.01),
+        window=pre.get("window", "hann"),
+        preemph=pre.get("preemph", 0.97),
+        dither=pre.get("dither", 1.0e-5),
+        normalize=str(pre.get("normalize", "NA")),
+        log_zero_guard_value=float(pre.get("log_zero_guard_value", 2.0**-24)),
+        pad_to=pre.get("pad_to", 0),
+        pad_value=pre.get("pad_value", 0.0),
+    )
+
+
+def _conformer_args(enc: dict[str, Any]) -> ConformerArgs:
+    return ConformerArgs(
+        feat_in=enc.get("feat_in", 128),
+        n_layers=enc.get("n_layers", 24),
+        d_model=enc.get("d_model", 1024),
+        n_heads=enc.get("n_heads", 8),
+        ff_expansion_factor=enc.get("ff_expansion_factor", 4),
+        subsampling_factor=enc.get("subsampling_factor", 8),
+        subsampling_conv_channels=enc.get("subsampling_conv_channels", 256),
+        conv_kernel_size=enc.get("conv_kernel_size", 9),
+        causal_downsampling=enc.get("causal_downsampling", True),
+        conv_context_size=enc.get("conv_context_size", "causal"),
+        conv_norm_type=enc.get("conv_norm_type", "layer_norm"),
+        self_attention_model=enc.get("self_attention_model", "rel_pos"),
+        att_context_style=enc.get("att_context_style", "chunked_limited"),
+        att_context_size=_att_context_size(enc.get("att_context_size")),
+        pos_emb_max_len=enc.get("pos_emb_max_len", 5000),
+        use_bias=enc.get("use_bias", False),
+        xscaling=enc.get("xscaling", False),
+    )
+
+
+def _from_runtime_config(config: dict[str, Any]) -> NemotronVoiceChatConfig:
+    """Map an mlx-vlm style (``mlx_runtime_config_version``) config.
+
+    Everything the model and session need is in the file itself: the LLM
+    config lives in ``text_config`` and the tokenizer ships next to the
+    weights, so no network access is required.
+    """
+    text = dict(config["text_config"])
+    audio = config.get("audio_config", {})
+    pre = audio.get("preprocessor", {})
+    enc = audio.get("encoder", {})
+    decoder = audio.get("decoder", {})
+    joint = audio.get("joint", {})
+    tts = config.get("tts_config", {})
+    mog = tts.get("mog_head", {})
+    codec_raw = dict(config.get("codec_config", {}))
+
+    llm = NemotronHArgs.from_dict(text)
+    source_sample_rate = config.get("input_sample_rate", pre.get("sample_rate", 16_000))
+    target_sample_rate = config.get(
+        "output_sample_rate", codec_raw.get("sample_rate", 22_050)
+    )
+    codec_raw.setdefault("sample_rate", target_sample_rate)
+    frame_duration = config.get("frame_duration", 0.08)
+    num_classes = joint.get("num_classes", decoder.get("vocab_size", 1024))
+
+    return NemotronVoiceChatConfig(
+        llm=llm,
+        preprocessor=_preprocess_args(pre, source_sample_rate),
+        encoder=_conformer_args(enc),
+        decoder=PredictArgs(
+            pred_hidden=decoder.get("pred_hidden", 640),
+            pred_rnn_layers=decoder.get("pred_rnn_layers", 2),
+            vocab_size=decoder.get("vocab_size", 1024),
+            blank_as_pad=decoder.get("blank_as_pad", True),
+        ),
+        joint=JointArgs(
+            joint_hidden=joint.get("joint_hidden", 640),
+            activation=joint.get("activation", "relu"),
+            encoder_hidden=joint.get("encoder_hidden", enc.get("d_model", 1024)),
+            pred_hidden=joint.get("pred_hidden", 640),
+            num_classes=num_classes,
+        ),
+        codec=NemotronVoiceChatCodecConfig.from_dict(codec_raw),
+        tts=VoiceChatTTSConfig(
+            hidden_size=tts.get("hidden_size", 1152),
+            intermediate_size=tts.get("intermediate_size", 4608),
+            num_hidden_layers=tts.get("num_hidden_layers", 28),
+            num_attention_heads=tts.get("num_attention_heads", 16),
+            num_key_value_heads=tts.get("num_key_value_heads", 16),
+            head_dim=tts.get("head_dim", 72),
+            sliding_window=tts.get("sliding_window", 7500),
+            latent_size=tts.get("latent_size", 512),
+            codebook_size=tts.get("codebook_size", 1024),
+            num_quantizers=tts.get("num_quantizers", 31),
+            exponent=tts.get("exponent", 3.0),
+            num_iterations=tts.get("num_iterations", 8),
+            guidance_scale=tts.get("guidance_scale", 0.2),
+            top_p=tts.get("top_p", 0.95),
+            noise_scale=tts.get("noise_scale", 0.001),
+            char_vocab_size=tts.get("char_vocab_size", 256),
+            text_vocab_size=llm.vocab_size,
+            mog_intermediate_size=mog.get("intermediate_size", 4608),
+            mog_num_layers=mog.get("num_layers", 3),
+            mog_num_predictions=mog.get("num_predictions", 1024),
+            mog_low_rank=mog.get("low_rank", 64),
+            mog_min_log_std=mog.get("min_log_std", -4.0),
+        ),
+        pretrained_llm=config.get("pretrained_llm", DEFAULT_PRETRAINED_LLM),
+        rnnt_vocabulary=list(config.get("rnnt_vocabulary", [])),
+        source_sample_rate=source_sample_rate,
+        target_sample_rate=target_sample_rate,
+        frame_duration=frame_duration,
+        audio_prompt_frames=int(tts.get("audio_prompt_duration", 3.0) / frame_duration),
+        output_dim=audio.get("output_dim", llm.hidden_size),
+        text_channel_weight=config.get("text_channel_weight", 1.0),
+        audio_channel_weight=config.get("audio_channel_weight", 1.0),
+        function_channel_weight=config.get("function_channel_weight", 2.0),
+        use_function_head=config.get("use_function_head", True),
+        speaker_name=config.get("speaker", config.get("speaker_name", "Aria")),
+        bos_token_id=config.get("bos_token_id", 1),
+        eos_token_id=config.get("eos_token_id", 2),
+        pad_token_id=config.get("pad_token_id", 12),
+        silence_token_id=config.get("silence_token_id", 11),
+        rnnt_blank_id=config.get("rnnt_blank_id", num_classes),
+        rnnt_max_symbols=audio.get("max_symbols", 10),
+        default_system_prompt=config.get("default_system_prompt", ""),
+        prepared_weights=config.get("prepared_weights", False),
+        model_type=config.get("model_type", "nemotron_voicechat"),
+    )
+
+
 class ModelConfig:
     def __init__(self, config: NemotronVoiceChatConfig):
         self.config = config
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> "ModelConfig":
+        if is_runtime_config(config):
+            return cls(_from_runtime_config(config))
+
         data = config.get("data", {})
         root = config.get("model", {})
         stt_root = root.get("stt", {})
@@ -125,7 +283,7 @@ class ModelConfig:
         backbone = tts_config.get("backbone_config", {})
         mog = tts_config.get("mog_head_config", {})
         codec_raw = speech.get("codec_config", {})
-        pretrained_llm = stt.get("pretrained_llm", "nvidia/NVIDIA-Nemotron-Nano-9B-v2")
+        pretrained_llm = stt.get("pretrained_llm", DEFAULT_PRETRAINED_LLM)
         llm = NemotronHArgs.from_dict(_llm_config(config, pretrained_llm))
         source_sample_rate = data.get(
             "source_sample_rate",
@@ -139,39 +297,8 @@ class ModelConfig:
 
         parsed = NemotronVoiceChatConfig(
             llm=llm,
-            preprocessor=PreprocessArgs(
-                sample_rate=pre.get("sample_rate", source_sample_rate),
-                features=pre.get("features", 128),
-                n_fft=pre.get("n_fft", 512),
-                window_size=pre.get("window_size", 0.025),
-                window_stride=pre.get("window_stride", 0.01),
-                window=pre.get("window", "hann"),
-                preemph=pre.get("preemph", 0.97),
-                dither=pre.get("dither", 1.0e-5),
-                normalize=str(pre.get("normalize", "NA")),
-                log_zero_guard_value=float(pre.get("log_zero_guard_value", 2.0**-24)),
-                pad_to=pre.get("pad_to", 0),
-                pad_value=pre.get("pad_value", 0.0),
-            ),
-            encoder=ConformerArgs(
-                feat_in=enc.get("feat_in", 128),
-                n_layers=enc.get("n_layers", 24),
-                d_model=enc.get("d_model", 1024),
-                n_heads=enc.get("n_heads", 8),
-                ff_expansion_factor=enc.get("ff_expansion_factor", 4),
-                subsampling_factor=enc.get("subsampling_factor", 8),
-                subsampling_conv_channels=enc.get("subsampling_conv_channels", 256),
-                conv_kernel_size=enc.get("conv_kernel_size", 9),
-                causal_downsampling=enc.get("causal_downsampling", True),
-                conv_context_size=enc.get("conv_context_size", "causal"),
-                conv_norm_type=enc.get("conv_norm_type", "layer_norm"),
-                self_attention_model=enc.get("self_attention_model", "rel_pos"),
-                att_context_style=enc.get("att_context_style", "chunked_limited"),
-                att_context_size=[enc.get("att_context_size", [70, 0])],
-                pos_emb_max_len=enc.get("pos_emb_max_len", 5000),
-                use_bias=enc.get("use_bias", False),
-                xscaling=enc.get("xscaling", False),
-            ),
+            preprocessor=_preprocess_args(pre, source_sample_rate),
+            encoder=_conformer_args(enc),
             decoder=PredictArgs(
                 pred_hidden=decoder.get("pred_hidden", 640),
                 pred_rnn_layers=decoder.get("pred_rnn_layers", 2),

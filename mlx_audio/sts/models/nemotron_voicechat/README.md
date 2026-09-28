@@ -20,6 +20,15 @@ print(output.text)
 output.audio
 ```
 
+The mlx-community checkpoints use the mlx-vlm config layout
+(`mlx_runtime_config_version: 2`) and ship the Nemotron tokenizer. The loader
+reads the LLM config and tokenizer from the checkpoint folder, so a downloaded
+checkpoint loads with `HF_HUB_OFFLINE=1`:
+
+```python
+model = load("/path/to/NemotronLabs-VoiceChat-11B-4bit")
+```
+
 ## Converting from source
 
 The original checkpoint is a 44 GB NeMo export. To produce a custom
