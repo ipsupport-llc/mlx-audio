@@ -592,3 +592,41 @@ def test_compiled_codec_decode_step_matches_eager_decode():
     assert "_compiled_decode" in codec.__dict__ and codec.__dict__["_compiled_decode"].fns
     assert eager.shape == stepped.shape
     assert mx.abs(eager - stepped).max().item() < 1e-5
+
+
+def test_static_backbone_step_matches_the_eager_caches():
+    # Past the mini config's 16-frame sliding window and across buffer
+    # growth (chunk 8), guidance on and off: the same hidden states.
+    from mlx_audio.sts.models.nemotron_voicechat.tts import StaticBackboneCache
+
+    model = Model(ModelConfig.from_dict(mini_config()))
+    tts = model.tts_model.tts_model
+    hidden_size = tts.config.hidden_size
+    previous = mx.default_device()
+    mx.set_default_device(mx.cpu)  # exact fp32; Metal's fp32 matmul rounds like tf32
+    try:
+        for batch in (1, 2):
+            mx.random.seed(11)
+            prompt = mx.random.normal((batch, 5, hidden_size))
+            steps = [mx.random.normal((batch, 1, hidden_size)) for _ in range(30)]
+
+            def run(chunk):
+                tts.backbone_buffer_chunk = chunk
+                cache = tts.make_cache()
+                tts.backbone(None, cache=cache, input_embeddings=prompt)
+                out = []
+                for x in steps:
+                    h, cache = tts._backbone_step(x, cache)
+                    out.append(h)
+                return mx.concatenate(out, axis=1), cache
+
+            eager, eager_cache = run(0)
+            static, static_cache = run(8)
+            assert isinstance(eager_cache, list)
+            assert isinstance(static_cache, StaticBackboneCache)
+            assert static_cache.offset == 35 and static_cache.capacity == 40
+            assert mx.abs(eager - static).max().item() < 1e-5, batch
+    finally:
+        tts.backbone_buffer_chunk = type(tts).backbone_buffer_chunk
+        mx.set_default_device(previous)
+    assert tts.__dict__["_compiled_backbone_fns"].fns

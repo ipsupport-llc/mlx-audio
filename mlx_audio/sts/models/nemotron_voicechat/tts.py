@@ -307,7 +307,70 @@ class GatedProjectedSumRMSNorm(nn.Module):
         return self.final_norm(residual_scale * (gate * audio + (1 - gate) * text))
 
 
+class _BufferLayerCache:
+    """One layer's view of a StaticBackboneCache inside the compiled step:
+    what gemma3_text's Attention asks of a cache (``offset`` for RoPE,
+    ``update_and_fetch``), writing the frame's K/V at ``offset`` into the
+    fixed buffers and handing back all of them (masked by the caller)."""
+
+    def __init__(self, keys: mx.array, values: mx.array, offset: mx.array):
+        self.keys, self.values, self.offset = keys, values, offset
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        start = mx.reshape(self.offset, (1,))
+        self.keys = mx.slice_update(self.keys, keys.astype(self.keys.dtype), start, axes=(2,))
+        self.values = mx.slice_update(self.values, values.astype(self.values.dtype), start, axes=(2,))
+        return self.keys, self.values
+
+
+class StaticBackboneCache:
+    """The TTS backbone's K/V in buffers of a fixed length (``capacity``,
+    grown by ``chunk`` frames when full), so one frame's step has fixed
+    shapes and runs as one compiled graph instead of ~28 layers of small
+    kernels. Entries past ``offset`` are masked out; the sliding layers
+    also mask what their RotatingKVCache would have dropped, so the step is
+    exact at any length (the buffers keep growing, as the global layers'
+    KVCache does anyway)."""
+
+    def __init__(self, keys: list, values: list, offset: int, chunk: int):
+        self.keys, self.values, self.offset, self.chunk = keys, values, offset, chunk
+
+    @property
+    def capacity(self) -> int:
+        return self.keys[0].shape[2]
+
+    @classmethod
+    def from_caches(cls, caches: list, chunk: int) -> "StaticBackboneCache | None":
+        """From the prefilled KVCache/RotatingKVCache list, while every
+        layer still holds its whole history in order (None otherwise)."""
+        offset = caches[0].offset
+        keys, values = [], []
+        for cache in caches:
+            if cache.offset != offset or cache.keys is None or cache.keys.shape[2] < offset:
+                return None
+            if isinstance(cache, RotatingKVCache) and offset >= cache.max_size:
+                return None
+            keys.append(cache.keys[..., :offset, :])
+            values.append(cache.values[..., :offset, :])
+        static = cls(keys, values, offset, chunk)
+        static._grow(offset + 1)
+        return static
+
+    def _grow(self, needed: int) -> None:
+        if needed <= self.capacity:
+            return
+        capacity = -(-needed // self.chunk) * self.chunk
+        pad = ((0, 0), (0, 0), (0, capacity - self.capacity), (0, 0))
+        self.keys = [mx.pad(k, pad) for k in self.keys]
+        self.values = [mx.pad(v, pad) for v in self.values]
+
+
 class EARTTSModel(nn.Module):
+    # Frames the backbone's static K/V buffers grow by (one compiled graph
+    # per capacity): 512 frames = 41 s of speech, at most ~0.3 ms of masked
+    # attention a step. 0: the eager backbone with growing caches.
+    backbone_buffer_chunk = 512
+
     def __init__(self, config: VoiceChatTTSConfig):
         super().__init__()
         self.config = config
@@ -419,9 +482,53 @@ class EARTTSModel(nn.Module):
         if guidance_enabled:
             code_embeddings = mx.concatenate([code_embeddings] * 2, axis=0)
         inputs = self.gated_fusion_audio_text(code_embeddings, conditioning)
-        hidden = self.backbone(None, cache=cache, input_embeddings=inputs)
+        hidden, cache = self._backbone_step(inputs, cache)
         codes = self._generate_codes(hidden, guidance_enabled=guidance_enabled)
         return codes, cache
+
+    def _backbone_step(self, inputs: mx.array, cache):
+        """One frame through the backbone: compiled over static K/V buffers
+        (from the first step after warmup), or eager with the growing caches
+        when ``backbone_buffer_chunk`` is 0 or the prefill already rotated."""
+        if self.backbone_buffer_chunk > 0 and isinstance(cache, list):
+            cache = StaticBackboneCache.from_caches(cache, self.backbone_buffer_chunk) or cache
+        if not isinstance(cache, StaticBackboneCache):
+            return self.backbone(None, cache=cache, input_embeddings=inputs), cache
+        cache._grow(cache.offset + 1)
+        fn = self._compiled_backbone(cache.capacity, inputs.shape, inputs.dtype, cache.keys[0].dtype)
+        hidden, *state = fn(inputs, mx.array(cache.offset, dtype=mx.int32), *cache.keys, *cache.values)
+        layers = len(cache.keys)
+        cache.keys, cache.values = list(state[:layers]), list(state[layers:])
+        cache.offset += 1
+        return hidden, cache
+
+    def _compiled_backbone(self, capacity: int, shape, dtype, kv_dtype):
+        compiled = self.__dict__.setdefault("_compiled_backbone_fns", SimpleNamespace(fns={}))
+        key = (capacity, tuple(shape), dtype, kv_dtype)
+        fn = compiled.fns.get(key)
+        if fn is None:
+            fn = mx.compile(self._backbone_step_static)
+            compiled.fns[key] = fn
+        return fn
+
+    def _backbone_step_static(self, inputs: mx.array, offset: mx.array, *buffers):
+        backbone = self.backbone
+        layers = len(backbone.layers)
+        keys, values = buffers[:layers], buffers[layers:]
+        positions = mx.arange(keys[0].shape[2])
+        seen = positions <= offset
+        global_mask = seen[None, None, None, :]
+        local_mask = (seen & (positions > offset - self.config.sliding_window))[None, None, None, :]
+        pattern = backbone.sliding_window_pattern
+        h = inputs
+        new_keys, new_values = [], []
+        for index, layer in enumerate(backbone.layers):
+            view = _BufferLayerCache(keys[index], values[index], offset)
+            mask = global_mask if index % pattern == pattern - 1 else local_mask
+            h = layer(h, mask, view)
+            new_keys.append(view.keys)
+            new_values.append(view.values)
+        return (backbone.norm(h), *new_keys, *new_values)
 
     def _generate_codes(self, hidden: mx.array, *, guidance_enabled: bool) -> mx.array:
         """One frame's codes (num_iterations MoG steps over the RVQ levels:
