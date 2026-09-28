@@ -11,6 +11,10 @@ from mlx_audio.dsp import ISTFTCache, hanning, stft
 from .config import NemotronVoiceChatCodecConfig
 
 
+# decode_step graphs, compiled per (codec, cache entries, input shape).
+_COMPILED_DECODE: dict = {}
+
+
 class CausalConv1dCache:
     """Per-layer causal-convolution and spectrogram overlap state."""
 
@@ -430,7 +434,27 @@ class NemotronVoiceChatCodec(nn.Module):
 
         if cache is None:
             raise ValueError("decode_step requires a per-stream cache")
-        return self.decode(codes, cache=cache, flush=flush)
+        # After the first step every cache entry exists with a fixed shape:
+        # one compiled graph per (entries, input shape) instead of the many
+        # small conv kernels per frame. The first step and a flush run eager.
+        if flush or not cache.cache:
+            return self.decode(codes, cache=cache, flush=flush)
+        keys = tuple(sorted(cache.cache, key=str))
+        key = (id(self), keys, codes.shape, codes.dtype)
+        fn = _COMPILED_DECODE.get(key)
+        if fn is None:
+
+            def step(c, *states):
+                tmp = CausalConv1dCache()
+                tmp.cache = dict(zip(keys, states))
+                out = self.decode(c, cache=tmp)
+                return (out, *[tmp.cache[k] for k in keys])
+
+            fn = mx.compile(step)
+            _COMPILED_DECODE[key] = fn
+        out, *states = fn(codes, *[cache.cache[k] for k in keys])
+        cache.cache = dict(zip(keys, states))
+        return out
 
     def sanitize(
         self, weights: Mapping[str, mx.array], prefix: str = ""
