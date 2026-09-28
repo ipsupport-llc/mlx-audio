@@ -15,15 +15,17 @@ import mlx.nn as nn
 _PRE_ENCODE_MEL_CACHE = 16  # >= causal receptive field of the 8x dw-striding stack
 
 
-def _stream_block(block, x, pos_enc, attn_cache, conv_cache, left_cache, conv_left):
+def _stream_block(
+    block, x, pos_enc, attn_cache, conv_cache, left_cache, conv_left, pos_proj=None
+):
     # half-step FFN 1
     residual = x + 0.5 * block.feed_forward1(block.norm_feed_forward1(x))
 
     # cache-aware self-attention: Q = chunk, K/V = [cache ++ chunk]
     xn = block.norm_self_att(residual)
     kv = xn if attn_cache is None else mx.concatenate([attn_cache, xn], axis=1)
-    pos_emb = pos_enc.pos_emb_for(kv.shape[1], x.dtype)
-    residual = residual + block.self_attn.stream(xn, kv, pos_emb)
+    pos_emb = None if pos_proj is not None else pos_enc.pos_emb_for(kv.shape[1], x.dtype)
+    residual = residual + block.self_attn.stream(xn, kv, pos_emb, pos_proj=pos_proj)
     attn_next = kv[:, -left_cache:] if left_cache > 0 else kv[:, :0]
 
     # cache-aware causal conv: prepend conv cache instead of zero-padding
@@ -51,8 +53,11 @@ class ConformerStreamingState:
     returned as a list of ``(B, T, D)`` arrays.
     """
 
-    def __init__(self, encoder, *, chunk_frames=None, att_context_size=None):
+    def __init__(self, encoder, *, chunk_frames=None, att_context_size=None, compile_steady=True):
         self.encoder = encoder
+        # mx.compile of the steady-state layer stack (see _encode_mel_chunk).
+        self.compile_steady = compile_steady
+        self._compiled_layers = None
         acs = att_context_size or encoder.args.att_context_size[0]
         self.left_cache = int(acs[0])
         self.right_context = int(acs[1])
@@ -64,6 +69,14 @@ class ConformerStreamingState:
         self.conv_left = encoder.args.conv_kernel_size - 1
 
         n = len(encoder.layers)
+        # Run the encoder in its weight dtype: the mel frontend yields float32, and
+        # float32 activations against bf16 weights promote every matmul to float32
+        # (3.4x slower per frame on an M5, same tokens).
+        self.dtype = encoder.pre_encode.out.weight.dtype
+        if not mx.issubdtype(self.dtype, mx.floating):
+            self.dtype = mx.bfloat16  # quantized weights: compute in bf16
+        # linear_pos(pos_emb) per layer, keyed by window length (steady state: one key)
+        self._pos_proj: dict[int, list[mx.array]] = {}
         self.attn_cache = [None] * n
         self.conv_cache = [None] * n
         self.mel_cache = None
@@ -107,17 +120,54 @@ class ConformerStreamingState:
             return None
         self.emitted = base + hi
         h = sub[:, lo:hi]
+        window = h.shape[1] + (0 if self.attn_cache[0] is None else self.attn_cache[0].shape[1])
+        pos_proj = self._pos_projections(window, h.dtype)
+        # Steady state (full caches, the same chunk size every step): every
+        # shape repeats, so the layer stack runs as one compiled graph --
+        # hundreds of small kernels per frame fused into far fewer launches.
+        steady = (
+            self.compile_steady
+            and self.left_cache > 0
+            and all(c is not None and c.shape[1] == self.left_cache for c in self.attn_cache)
+            and all(c is not None for c in self.conv_cache)
+        )
+        if steady:
+            if self._compiled_layers is None:
+                self._compiled_layers = mx.compile(self._layers)
+            h, attn, conv = self._compiled_layers(h, self.attn_cache, self.conv_cache, pos_proj)
+            self.attn_cache, self.conv_cache = list(attn), list(conv)
+            return h
+        h, self.attn_cache, self.conv_cache = self._layers(h, self.attn_cache, self.conv_cache, pos_proj)
+        return h
+
+    def _layers(self, h, attn_cache, conv_cache, pos_proj):
+        attn_next, conv_next = [], []
         for li, block in enumerate(self.encoder.layers):
-            h, self.attn_cache[li], self.conv_cache[li] = _stream_block(
+            h, a, c = _stream_block(
                 block,
                 h,
                 self.encoder.pos_enc,
-                self.attn_cache[li],
-                self.conv_cache[li],
+                attn_cache[li],
+                conv_cache[li],
                 self.left_cache,
                 self.conv_left,
+                pos_proj[li],
             )
-        return h
+            attn_next.append(a)
+            conv_next.append(c)
+        return h, attn_next, conv_next
+
+    def _pos_projections(self, window: int, dtype) -> list[mx.array]:
+        cached = self._pos_proj.get(window)
+        if cached is None or cached[0].dtype != dtype:
+            pos_emb = self.encoder.pos_enc.pos_emb_for(window, dtype)
+            cached = [block.self_attn.linear_pos(pos_emb) for block in self.encoder.layers]
+            mx.eval(cached)
+            # keep only the steady-state window (the largest seen) plus this one
+            keep = max(self._pos_proj, default=window)
+            self._pos_proj = {k: v for k, v in self._pos_proj.items() if k == keep}
+            self._pos_proj[window] = cached
+        return cached
 
     def push(self, mel, *, final=False, emit_partial=False):
         """Push mel frames and return newly encoded chunks.
@@ -139,7 +189,7 @@ class ConformerStreamingState:
             if (final or emit_partial) and self.pending.shape[1] <= self.chunk_mel:
                 take = self.pending.shape[1]
 
-            m = self.pending[:, :take]
+            m = self.pending[:, :take].astype(self.dtype)
             self.pending = self.pending[:, take:]
             include_boundary = (final or emit_partial) and self.pending.shape[1] == 0
             encoded = self._encode_mel_chunk(m, include_boundary)
