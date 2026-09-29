@@ -592,3 +592,43 @@ def test_compiled_codec_decode_step_matches_eager_decode():
     assert "_compiled_decode" in codec.__dict__ and codec.__dict__["_compiled_decode"].fns
     assert eager.shape == stepped.shape
     assert mx.abs(eager - stepped).max().item() < 1e-5
+
+
+def test_tts_pauses_while_quiet_and_resumes_on_a_token():
+    from types import SimpleNamespace
+
+    model = Model(ModelConfig.from_dict(mini_config()))
+    model.tokenizer = MiniTokenizer()
+    # rms threshold above anything the random mini codec makes: every
+    # pad frame counts as quiet.
+    stream = model.create_duplex_session(system_prompt="", tts_idle_frames=3, tts_idle_rms=1e9)
+    stream._rnnt.step = lambda _encoded: None
+    pad = stream.config.pad_token_id
+    script = [pad] * 6 + [4] + [pad] * 2
+    language_step = stream._language_step
+
+    def forced(inputs):
+        out = language_step(inputs)
+        wanted = script[min(len(stream._text_tokens), len(script) - 1)]
+        text = mx.full(out.text_logits.shape, -1e9).at[..., wanted].add(2e9)
+        function = mx.full(out.function_logits.shape, -1e9).at[..., pad].add(2e9)
+        return SimpleNamespace(text_logits=text, function_logits=function)
+
+    stream._language_step = forced
+    tts = model.tts_model.tts_model
+    offsets, audio = [], []
+    for _ in script:
+        events = stream.push_audio(mx.zeros((stream.frame_samples,)), sample_rate=16_000)
+        audio += [e for e in events if e.kind == "audio"]
+        offsets.append(stream._tts_cache[0].offset if isinstance(stream._tts_cache, list) else stream._tts_cache.offset)
+
+    assert stream._text_tokens == script
+    # Frames 0-2 are quiet (frame 0 decodes the warm-up silence), 3-5
+    # pause, the token at frame 6 resumes the TTS, and frames 7-8 are only
+    # 2 quiet in a row: running again.
+    assert stream.tts_idle_skipped == 3
+    assert offsets[2] == offsets[3] == offsets[4] == offsets[5]
+    assert offsets[6] == offsets[5] + 1 and offsets[8] == offsets[6] + 2
+    assert len(audio) == len(script)
+    assert all(mx.all(e.samples == 0).item() for e in audio[3:6])
+    assert audio[6].audio_codes is not None

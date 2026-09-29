@@ -115,10 +115,21 @@ class VoiceChatStreamingSession:
         use_language_cache: bool = True,
         use_perception_cache: bool = True,
         tts_guidance: bool = True,
+        tts_idle_frames: int = 0,
+        tts_idle_rms: float = 1e-3,
     ):
         """``tts_guidance`` runs the TTS with classifier-free guidance (the
         model's inference_guidance_scale; a batch of two per frame). Off, the
-        TTS backbone runs once per frame."""
+        TTS backbone runs once per frame.
+
+        ``tts_idle_frames`` > 0: once the model has been quiet that many
+        frames in a row (no text or function token, decoded speech RMS below
+        ``tts_idle_rms``), the TTS and codec pause -- the frame's audio is
+        silence -- until the next text or function token, when they resume
+        from where they paused. An approximation (the TTS's history misses
+        the paused frames), for listening stretches; 0 runs every frame."""
+        if tts_idle_frames < 0 or tts_idle_rms < 0:
+            raise ValueError("tts_idle_frames and tts_idle_rms must be non-negative")
         if max_streaming_seconds is not None and max_streaming_seconds <= 0:
             raise ValueError("max_streaming_seconds must be positive")
         self.parent = parent
@@ -177,6 +188,12 @@ class VoiceChatStreamingSession:
         self._rnnt = _RNNTState(self)
         self._codec_cache = CausalConv1dCache()
         self._tts_guidance = tts_guidance
+        self._tts_idle_frames = tts_idle_frames
+        self._tts_idle_rms = tts_idle_rms
+        self._quiet_frames = 0
+        self._tts_idle = False
+        # Frames the TTS paused through (for measuring).
+        self.tts_idle_skipped = 0
         mx.random.seed(seed)
         prompt = self.parent._tts_prompt()
         self._previous_code, self._tts_cache = self.model.tts_model.tts_model.warmup(
@@ -290,6 +307,26 @@ class VoiceChatStreamingSession:
         )
         self._text_tokens.append(text_id)
         self._function_tokens.append(function_id)
+        quiet_tokens = text_id == pad_id and function_id == pad_id
+        if self._tts_idle and not quiet_tokens:
+            self._tts_idle = False
+            self._quiet_frames = 0
+        if self._tts_idle:
+            self._timeline_index += 1
+            self.tts_idle_skipped += 1
+            mx.eval(output.text_logits, output.function_logits)
+            if not generate_channels or not decode_audio:
+                return []
+            expected = self.model.tts_model.audio_codec.waveform_to_token_ratio
+            return [
+                VoiceChatEvent(
+                    kind="audio",
+                    frame_index=self._frame_index,
+                    samples=mx.zeros((expected,), dtype=mx.float32),
+                    sample_rate=self.output_sample_rate,
+                    audio_codes=None,
+                )
+            ]
         if self._timeline_index > 0:
             current = mx.array([[text_id]], dtype=mx.int32)
             self._previous_code, self._tts_cache = (
@@ -341,6 +378,11 @@ class VoiceChatStreamingSession:
                 clean_code.transpose(0, 2, 1), self._codec_cache
             )[0, 0]
             mx.eval(samples)
+            if self._tts_idle_frames > 0:
+                rms = mx.sqrt(mx.mean(mx.square(samples.astype(mx.float32)))).item()
+                quiet = quiet_tokens and rms < self._tts_idle_rms
+                self._quiet_frames = self._quiet_frames + 1 if quiet else 0
+                self._tts_idle = self._quiet_frames >= self._tts_idle_frames
             expected = self.model.tts_model.audio_codec.waveform_to_token_ratio
             if samples.shape[0] != expected:
                 raise RuntimeError(
