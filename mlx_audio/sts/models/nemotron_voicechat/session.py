@@ -129,6 +129,8 @@ class VoiceChatSession:
         use_language_cache: bool = True,
         use_perception_cache: bool = True,
         tts_guidance: bool = True,
+        tts_idle_frames: int = 0,
+        tts_idle_rms: float = 1e-3,
     ):
         from .streaming import VoiceChatStreamingSession
 
@@ -140,6 +142,8 @@ class VoiceChatSession:
             use_language_cache=use_language_cache,
             use_perception_cache=use_perception_cache,
             tts_guidance=tts_guidance,
+            tts_idle_frames=tts_idle_frames,
+            tts_idle_rms=tts_idle_rms,
         )
 
     def generate(
