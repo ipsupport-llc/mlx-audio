@@ -632,3 +632,30 @@ def test_tts_pauses_while_quiet_and_resumes_on_a_token():
     assert len(audio) == len(script)
     assert all(mx.all(e.samples == 0).item() for e in audio[3:6])
     assert audio[6].audio_codes is not None
+
+
+def test_stream_block_keeps_no_conv_state_for_a_kernel_of_one():
+    # conv_left == 0: `din[:, -0:]` kept -- and grew -- the whole history.
+    import copy
+
+    from mlx_audio.stt.models.nemotron_asr.streaming import _stream_block
+
+    cfg = copy.deepcopy(mini_config())
+
+    def set_kernel(node):
+        if isinstance(node, dict):
+            if "conv_kernel_size" in node:
+                node["conv_kernel_size"] = 1
+            for v in node.values():
+                set_kernel(v)
+
+    set_kernel(cfg)
+    model = Model(ModelConfig.from_dict(cfg))
+    encoder = model.stt_model.perception.encoder
+    block = encoder.layers[0]
+    hidden = next(iter(v for k, v in block.parameters().items() if k == "norm_out"))["weight"].shape[0]
+    conv_cache = None
+    for _ in range(3):
+        x = mx.random.normal((1, 1, hidden))
+        _, _, conv_cache = _stream_block(block, x, encoder.pos_enc, None, conv_cache, 0, 0)
+        assert conv_cache.shape[1] == 0
