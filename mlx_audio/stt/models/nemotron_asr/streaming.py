@@ -35,7 +35,8 @@ def _stream_block(
         conv_cache = mx.zeros((g.shape[0], conv_left, g.shape[2]), dtype=g.dtype)
     din = mx.concatenate([conv_cache, g], axis=1)
     dw = block.conv.depthwise_conv(din)  # valid conv -> (B, c, d)
-    conv_next = din[:, -conv_left:]
+    # -0 would keep the whole history: a kernel of 1 has no conv state.
+    conv_next = din[:, -conv_left:] if conv_left > 0 else din[:, :0]
     y = block.conv.batch_norm(dw)
     y = block.conv.activation(y)
     residual = residual + block.conv.pointwise_conv2(y)
